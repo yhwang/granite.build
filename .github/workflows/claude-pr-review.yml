@@ -69,6 +69,21 @@ jobs:
           permission-contents: read
           permission-pull-requests: write
 
+      - name: Acknowledge /code-review with 👀 reaction
+        # Immediate feedback that the command was received: the review takes
+        # a minute or two, and issue_comment runs don't show up in the PR's
+        # Checks list. Uses the App token (pull-requests: write covers
+        # reactions on PR comments). Non-fatal: a failed reaction must not
+        # block the review.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          COMMENT_ID: ${{ github.event.comment.id }}
+        run: |
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content=eyes --silent
+
       - name: Checkout PR (merge ref)
         # issue_comment carries no PR ref, so check out the PR's merge commit
         # explicitly via its pull ref. The review mainly uses `gh pr diff`
