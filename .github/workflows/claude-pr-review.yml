@@ -1,0 +1,235 @@
+name: Claude PR Review
+
+# Trust model / accepted risk:
+# Triggered by a `/code-review` comment on a PR (issue_comment). Unlike a
+# pull_request trigger, this runs the workflow file from the DEFAULT branch,
+# so a PR branch cannot rewrite the reviewer. BUT issue_comment runs with repo
+# secrets even for comments on *fork* PRs, so the job is gated to commenters
+# with write-level trust (OWNER/MEMBER/COLLABORATOR). That gate is REQUIRED:
+# without it, an outside fork contributor could comment /code-review and run
+# with secrets on the self-hosted runner while checking out their own code.
+# Consequences of a secret leak are kept low:
+#   - LITELLM_API_KEY and its endpoint are reachable only from the IBM internal
+#     network, so a leaked key is useless to an outside party.
+#   - The review GitHub App is installed on this repo only, and the token minted
+#     below is scoped to this repo with just contents:read + pull-requests:write,
+#     so a leaked App key can at most comment on this one repo.
+# For a stronger boundary, add a secrets-bearing Environment with required
+# reviewers and/or an ephemeral runner.
+
+on:
+  issue_comment:
+    types: [created]
+
+# One review per PR; a new /code-review cancels an in-flight run for that PR.
+concurrency:
+  group: claude-review-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  # The built-in GITHUB_TOKEN only needs read access to check out the PR.
+  # PR comments are posted with the GitHub App token minted below, which
+  # carries pull-requests: write, so GITHUB_TOKEN doesn't need it.
+  contents: read
+  # id-token is intentionally omitted: a github_token is passed to the
+  # action, so it never does the OIDC->App-token exchange. Least privilege.
+
+jobs:
+  review:
+    # Run only when a PR (not a plain issue) gets a comment that starts with
+    # /code-review, AND the commenter has write-level trust. The author-
+    # association gate is REQUIRED for security: issue_comment runs with repo
+    # secrets even for comments on fork PRs, so without it anyone able to
+    # comment could trigger a secret-bearing run on the self-hosted runner.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/code-review') &&
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+    # Target your self-hosted private runner by label.
+    # 'self-hosted' is required; 'claude-review' is the custom label you
+    # register the runner with (change it to match your runner).
+    runs-on: [self-hosted, claude-review]
+    # A stuck proxy call can't tie up the single runner for the 6h default.
+    timeout-minutes: 30
+    steps:
+      - name: Mint review-bot token
+        # Mint a short-lived token for your own GitHub App so review comments
+        # post as <your-app-name>[bot] instead of github-actions[bot].
+        # Requires repo secrets REVIEW_APP_ID and REVIEW_APP_PRIVATE_KEY, and
+        # the App installed on this repo with Pull requests: Read & write.
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.REVIEW_APP_ID }}
+          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
+          # Scope the token to this repo and only the permissions this job
+          # needs, so a token handed to a third-party action / LLM can't act
+          # on other repos the App is installed on.
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: write
+
+      - name: Checkout PR (merge ref)
+        # issue_comment carries no PR ref, so check out the PR's merge commit
+        # explicitly via its pull ref. The review mainly uses `gh pr diff`
+        # (server-side); the checkout gives the model file context.
+        # Pinned to an exact release SHA; bump manually or via Dependabot.
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: refs/pull/${{ github.event.issue.number }}/merge
+          fetch-depth: 1
+          # Don't persist GITHUB_TOKEN in .git/config on the persistent
+          # self-hosted runner. This job only reads the tree; comments are
+          # posted via `gh` using the App token, so git creds aren't needed.
+          persist-credentials: false
+
+      - name: Quarantine PR-controlled Claude config
+        # The checkout is the PR merge commit, so .claude/, CLAUDE.md,
+        # CLAUDE.local.md, AGENTS.md and .mcp.json here reflect whatever the
+        # PR changed. Claude Code auto-loads these as instructions/config (NOT
+        # gated by --setting-sources or --allowedTools), which a PR could use
+        # to steer the reviewer or define a local MCP server. Move all of them
+        # -- at any depth, including hidden dirs like .github/ -- out of the
+        # workspace before the review. The review still sees these files'
+        # *changes* via `gh pr diff`.
+        run: |
+          set -euo pipefail
+          q="${RUNNER_TEMP}/pr-config-quarantine"
+          mkdir -p "$q"
+          moved=0
+          # find (not globs): prunes .git; prunes .claude so its contents
+          # aren't re-matched after the dir is moved; matches regular files
+          # AND symlinks (a PR could add CLAUDE.md as a symlink, which Claude
+          # Code still follows); reaches hidden dirs globbing skips.
+          while IFS= read -r -d '' p; do
+            rel="${p#"${GITHUB_WORKSPACE}"/}"
+            mkdir -p "$q/$(dirname "$rel")"
+            mv "$p" "$q/$rel"
+            moved=$((moved + 1))
+          done < <(find "$GITHUB_WORKSPACE" \
+                     -name .git -prune -o \
+                     -name .claude -prune -print0 -o \
+                     \( -type f -o -type l \) \
+                     \( -iname 'CLAUDE.md' -o -iname 'CLAUDE.local.md' \
+                        -o -iname 'AGENTS.md' -o -iname '.mcp.json' \) -print0)
+          echo "quarantined $moved Claude-config path(s)"
+          # Security assertion: FAIL the job if any auto-loadable config
+          # remains, so a gap (e.g. a path the match misses) stops the run
+          # instead of silently leaving PR-controlled config in place.
+          remaining="$(find "$GITHUB_WORKSPACE" -name .git -prune -o \
+            -name .claude -prune -print -o \
+            \( -iname 'CLAUDE.md' -o -iname 'CLAUDE.local.md' \
+               -o -iname 'AGENTS.md' -o -iname '.mcp.json' \) -print)"
+          if [ -n "$remaining" ]; then
+            echo "ERROR: Claude config still present after quarantine:" >&2
+            echo "$remaining" >&2
+            exit 1
+          fi
+          echo "verified: no Claude config remains in the workspace"
+
+      - name: Install review comment helper
+        # Write a tiny helper to a trusted, non-checkout location (runner.temp,
+        # written by this workflow, not from the PR tree). It posts the summary
+        # with the PR number FIXED by the workflow and the body taken from the
+        # arguments only: no --body-file, no stdin, no choice of target PR.
+        # This closes the Bash file-read / wrong-PR paths. File reads via the
+        # model's built-in Read/Glob/Grep tools are closed separately, by
+        # blockReadsOutsideWorkingDirectories in the review step's --settings.
+        env:
+          HELPER_DIR: ${{ runner.temp }}/review-bin
+        run: |
+          mkdir -p "$HELPER_DIR"
+          cat > "$HELPER_DIR/pr-comment" <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # Body = all args joined ("$*"), PR number from the workflow, not the
+          # model. Joining fails soft: if an unescaped apostrophe splits the
+          # body into several args, the whole text still posts (one lost quote)
+          # instead of being truncated at the first stray quote.
+          body="$*"
+          # Defense in depth: refuse to post a body that contains a known secret
+          # value, in case prompt injection makes the model pass e.g.
+          # "$ANTHROPIC_AUTH_TOKEN" (expanded by the calling shell before we run).
+          for s in "${ANTHROPIC_AUTH_TOKEN:-}" "${GH_TOKEN:-}" "${GITHUB_TOKEN:-}"; do
+            if [[ -n "$s" && "$body" == *"$s"* ]]; then
+              echo "pr-comment: refusing to post -- body contains a secret value" >&2
+              exit 1
+            fi
+          done
+          gh pr comment "${REVIEW_PR_NUMBER:?}" --body "$body"
+          SCRIPT
+          chmod +x "$HELPER_DIR/pr-comment"
+
+      - name: Claude Code Review
+        # Pinned to an exact release SHA: this third-party action receives the
+        # proxy credential and an App token, so don't track a moving tag.
+        uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1.0.271
+        env:
+          # Isolate HOME to a per-job temp dir. The action writes/reads its
+          # settings at $HOME/.claude/settings.json (it does NOT honor
+          # CLAUDE_CONFIG_DIR for this), so without this it would merge into
+          # the runner account's real ~/.claude — picking up personal dev
+          # settings and a persistent memory dir. A fresh HOME gives a clean,
+          # ephemeral ~/.claude: no personal config leaks in, and prompt-
+          # injected PR text can't persist into memory that later reviews load.
+          HOME: ${{ runner.temp }}/claude-home
+          # Consumed by the pr-comment helper so the model can't choose the
+          # target PR.
+          REVIEW_PR_NUMBER: ${{ github.event.issue.number }}
+          # Route all Claude API calls through your LiteLLM proxy.
+          ANTHROPIC_BASE_URL: ${{ secrets.LITELLM_BASE_URL }}
+          # Sent as the `Authorization: Bearer <token>` header to the proxy.
+          # This is the credential LiteLLM actually authenticates.
+          ANTHROPIC_AUTH_TOKEN: ${{ secrets.LITELLM_API_KEY }}
+          # Pin every alias to a model your LiteLLM config actually routes,
+          # so Claude Code never requests a name the proxy doesn't know.
+          ANTHROPIC_DEFAULT_OPUS_MODEL: aws/claude-opus-5-5
+          ANTHROPIC_DEFAULT_SONNET_MODEL: aws/claude-sonnet-5-5
+          # HAIKU var also drives background tasks (replaces deprecated
+          # ANTHROPIC_SMALL_FAST_MODEL).
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: aws/claude-haiku-5-5
+        with:
+          # Use our own GitHub App token so the action does NOT try to
+          # exchange an OIDC token for a Claude GitHub App token (that path
+          # requires the hosted Claude GitHub App and fails on a self-hosted /
+          # custom-endpoint setup). Comments post as <your-app-name>[bot].
+          github_token: ${{ steps.app-token.outputs.token }}
+          # The action requires a non-empty value to launch, but auth to the
+          # proxy is carried by ANTHROPIC_AUTH_TOKEN (Bearer) above, so a
+          # placeholder keeps the real key out of the extra x-api-key header.
+          # If your proxy validates x-api-key instead of Bearer, set this to
+          # ${{ secrets.LITELLM_API_KEY }}.
+          anthropic_api_key: "not-used-auth-via-bearer"
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.issue.number }}
+
+            Review this pull request for code quality, bugs, security, and
+            performance. The repository is checked out at the merge commit, so
+            use `gh pr diff` to see this PR's changes; local `git` history
+            (parents, blame, base..head) is not available.
+
+            For the top-level summary, post a NEW top-level comment each run by
+            running the helper with the whole summary as one single-quoted
+            argument:
+            ${{ runner.temp }}/review-bin/pr-comment '<your markdown summary>'
+            Important: inside the single quotes, write any apostrophe as '\''
+            (close-quote, escaped-quote, re-open) so contractions like it'\''s
+            don'\''t truncate the comment. The PR is fixed by the workflow; you
+            cannot choose it. Use the inline comment tool (with confirmed: true)
+            for specific line-level issues. Only post GitHub comments; do not
+            modify files or push.
+
+            Begin the summary comment with exactly this heading line and
+            nothing before it:
+            ## Code Review
+            Do NOT start any later line of the summary with "#" (no further
+            Markdown headings); use **bold** text for section titles instead.
+            A newline followed by "#" inside the quoted argument is rejected by
+            the shell permission check, and in this headless run that means the
+            summary never posts.
+          claude_args: |
+            --model "aws/claude-opus-5-5"
+            --setting-sources user
+            --settings '{"permissions":{"blockReadsOutsideWorkingDirectories":true}}'
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(${{ runner.temp }}/review-bin/pr-comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
