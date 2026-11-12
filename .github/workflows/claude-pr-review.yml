@@ -5,15 +5,23 @@ name: Claude PR Review
 # pull_request trigger, this runs the workflow file from the DEFAULT branch,
 # so a PR branch cannot rewrite the reviewer. BUT issue_comment runs with repo
 # secrets even for comments on *fork* PRs, so the job is gated to commenters
-# with write-level trust (OWNER/MEMBER/COLLABORATOR). That gate is REQUIRED:
+# with write-level trust. The allowed author_association values come from the
+# repository variable AUTO_CODE_REVIEW_APPROVERS (comma-separated, no spaces,
+# e.g. "OWNER,MEMBER"); when unset or empty it defaults to
+# OWNER,MEMBER,COLLABORATOR. Only repo admins can edit the variable. Valid
+# values are GitHub's author_association roles (OWNER, MEMBER, COLLABORATOR,
+# CONTRIBUTOR, ...); team names are not supported, because GITHUB_TOKEN cannot
+# resolve team membership. Do not add roles such as NONE/CONTRIBUTOR/
+# FIRST_TIMER unless you accept untrusted fork code running with secrets.
+# That gate is REQUIRED:
 # without it, an outside fork contributor could comment /code-review and run
 # with secrets on the self-hosted runner while checking out their own code.
 # Consequences of a secret leak are kept low:
 #   - LITELLM_API_KEY and its endpoint are reachable only from the IBM internal
 #     network, so a leaked key is useless to an outside party.
-#   - The review GitHub App is installed on this repo only, and the token minted
-#     below is scoped to this repo with just contents:read + pull-requests:write,
-#     so a leaked App key can at most comment on this one repo.
+#   - GitHub writes use the built-in GITHUB_TOKEN: no long-lived key to leak,
+#     scoped to this repo with just contents:read + pull-requests:write, and it
+#     expires when the job ends.
 # For a stronger boundary, add a secrets-bearing Environment with required
 # reviewers and/or an ephemeral runner.
 
@@ -21,16 +29,13 @@ on:
   issue_comment:
     types: [created]
 
-# One review per PR; a new /code-review cancels an in-flight run for that PR.
-concurrency:
-  group: claude-review-${{ github.event.issue.number }}
-  cancel-in-progress: true
-
 permissions:
-  # The built-in GITHUB_TOKEN only needs read access to check out the PR.
-  # PR comments are posted with the GitHub App token minted below, which
-  # carries pull-requests: write, so GITHUB_TOKEN doesn't need it.
+  # GITHUB_TOKEN reads the tree (checkout) and posts the review: summary and
+  # inline comments, plus the 👀 reaction. Comments post as github-actions[bot].
+  # Events created with GITHUB_TOKEN never trigger other workflows, so the
+  # bot's own comments can't start a review loop.
   contents: read
+  pull-requests: write
   # id-token is intentionally omitted: a github_token is passed to the
   # action, so it never does the OIDC->App-token exchange. Least privilege.
 
@@ -44,7 +49,16 @@ jobs:
     if: >-
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/code-review') &&
-      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)
+      contains(format(',{0},', vars.AUTO_CODE_REVIEW_APPROVERS || 'OWNER,MEMBER,COLLABORATOR'), format(',{0},', github.event.comment.author_association))
+    # One review per PR; a new /code-review cancels an in-flight review for
+    # that PR. This must be at the job level, not the workflow level: a
+    # workflow-level group is joined as soon as ANY PR comment queues a run,
+    # before the job's `if:` is evaluated, so an ordinary comment (or one from
+    # an untrusted user) would cancel a review already in progress. At the job
+    # level, only runs that pass the `if:` gate enter the group.
+    concurrency:
+      group: claude-review-${{ github.event.issue.number }}
+      cancel-in-progress: true
     # Target your self-hosted private runner by label.
     # 'self-hosted' is required; 'claude-review' is the custom label you
     # register the runner with (change it to match your runner).
@@ -52,32 +66,15 @@ jobs:
     # A stuck proxy call can't tie up the single runner for the 6h default.
     timeout-minutes: 30
     steps:
-      - name: Mint review-bot token
-        # Mint a short-lived token for your own GitHub App so review comments
-        # post as <your-app-name>[bot] instead of github-actions[bot].
-        # Requires repo secrets REVIEW_APP_ID and REVIEW_APP_PRIVATE_KEY, and
-        # the App installed on this repo with Pull requests: Read & write.
-        id: app-token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ secrets.REVIEW_APP_ID }}
-          private-key: ${{ secrets.REVIEW_APP_PRIVATE_KEY }}
-          # Scope the token to this repo and only the permissions this job
-          # needs, so a token handed to a third-party action / LLM can't act
-          # on other repos the App is installed on.
-          repositories: ${{ github.event.repository.name }}
-          permission-contents: read
-          permission-pull-requests: write
-
       - name: Acknowledge /code-review with 👀 reaction
         # Immediate feedback that the command was received: the review takes
         # a minute or two, and issue_comment runs don't show up in the PR's
-        # Checks list. Uses the App token (pull-requests: write covers
-        # reactions on PR comments). Non-fatal: a failed reaction must not
-        # block the review.
+        # Checks list. pull-requests: write on GITHUB_TOKEN covers reactions
+        # on PR comments. Non-fatal: a failed reaction must not block the
+        # review.
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMENT_ID: ${{ github.event.comment.id }}
         run: |
           gh api --method POST \
@@ -95,7 +92,7 @@ jobs:
           fetch-depth: 1
           # Don't persist GITHUB_TOKEN in .git/config on the persistent
           # self-hosted runner. This job only reads the tree; comments are
-          # posted via `gh` using the App token, so git creds aren't needed.
+          # posted via the action's API token, so git creds aren't needed.
           persist-credentials: false
 
       - name: Quarantine PR-controlled Claude config
@@ -177,7 +174,7 @@ jobs:
 
       - name: Claude Code Review
         # Pinned to an exact release SHA: this third-party action receives the
-        # proxy credential and an App token, so don't track a moving tag.
+        # proxy credential and a write-scoped token, so don't track a moving tag.
         uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1.0.271
         env:
           # Isolate HOME to a per-job temp dir. The action writes/reads its
@@ -204,11 +201,11 @@ jobs:
           # ANTHROPIC_SMALL_FAST_MODEL).
           ANTHROPIC_DEFAULT_HAIKU_MODEL: aws/claude-haiku-5-5
         with:
-          # Use our own GitHub App token so the action does NOT try to
+          # Pass GITHUB_TOKEN explicitly so the action does NOT try to
           # exchange an OIDC token for a Claude GitHub App token (that path
           # requires the hosted Claude GitHub App and fails on a self-hosted /
-          # custom-endpoint setup). Comments post as <your-app-name>[bot].
-          github_token: ${{ steps.app-token.outputs.token }}
+          # custom-endpoint setup). Comments post as github-actions[bot].
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           # The action requires a non-empty value to launch, but auth to the
           # proxy is carried by ANTHROPIC_AUTH_TOKEN (Bearer) above, so a
           # placeholder keeps the real key out of the extra x-api-key header.
