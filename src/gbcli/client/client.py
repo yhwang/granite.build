@@ -1,5 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import sys
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from gbcli.services.service_admin import server_log
 from gbcli.services.service_artifact import (
@@ -31,11 +33,11 @@ from gbcli.services.service_auth import (
     gh_login,
     gh_token,
     gh_token_verify,
-    ibmid_login,
     lakehouse_token_for_space,
     lh_artifact_token,
     lh_user_token,
     rits_user_api_key,
+    sso_login,
 )
 from gbcli.services.service_build import (
     build_cancel,
@@ -619,8 +621,15 @@ class GBClient:
         def login_gbserver(self, api_user: str, api_key: str):
             return gbserver_login(api_user, api_key)
 
-        def login_ibmid(self, open_browser=None):
-            return ibmid_login(open_browser=open_browser)
+        def login_sso(
+            self, open_browser=None, remote=False, read_code=None, redirect_port=None
+        ):
+            return sso_login(
+                open_browser=open_browser,
+                remote=remote,
+                read_code=read_code,
+                redirect_port=redirect_port,
+            )
 
     class Build:
         def __init__(self, github_token: str):
@@ -656,7 +665,7 @@ class GBClient:
             space: Optional[str] = None,
             params: Optional[List[str]] = [],
             skip_validation=False,
-            parameters_path: Optional[str] = None,
+            parameters_path: Optional[Sequence[str]] = None,
             targets: Optional[tuple[str, ...]] = (),
             description: str = "",
             tags: list[str] = [],
@@ -804,7 +813,7 @@ class GBClient:
             id_format: Optional[str] = None,
             space: Optional[str] = None,
             params: Optional[List[str]] = None,
-            parameters_path: Optional[str] = None,
+            parameters_path: Optional[Sequence[str]] = None,
             callback=None,
         ) -> List[Any]:
             return build_describe(
@@ -862,7 +871,7 @@ class GBClient:
             filename: Optional[str] = "",
             space: Optional[str] = None,
             params: Optional[List[str]] = [],
-            parameters_path: Optional[str] = None,
+            parameters_path: Optional[Sequence[str]] = None,
             targets: Optional[tuple[str, ...]] = (),
             callback=None,
             validation_type: str = "static",

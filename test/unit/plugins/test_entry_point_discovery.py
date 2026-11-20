@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright LLM.build Authors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
 """Unit tests for the entry-point plugin discovery mechanism.
 
@@ -762,7 +750,7 @@ def test_auth_provider_build_list_multi_order(
     monkeypatch, auth_provider_registry_snapshot
 ):
     """build_provider_list preserves the JWT-before-opaque order for 'multi'."""
-    monkeypatch.setenv("GBSERVER_IBMID_CLIENT_ID", "test-id")
+    monkeypatch.setenv("GBSERVER_OIDC_CLIENT_ID", "test-id")
     _patch_entry_points(monkeypatch, {})
 
     providers = auth_provider_registry_snapshot.build_provider_list("multi")

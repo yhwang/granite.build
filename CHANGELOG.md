@@ -49,6 +49,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requested chat template) before registering it. Build tests on local SLURM and local
   kind run MergeKit's `gradient-slerp` example on SmolLM2-135M + -Instruct, and
   `make test-mergekit` runs the real-MergeKit tests in a separate venv.
+- **`fms-hf-tuning` step (#231)**, `space://steps/train/fms-hf-tuning`: full fine-tuning, LoRA and
+  aLoRA with foundation-model-stack/fms-hf-tuning 3.2.2 (`tuning.sft_trainer`) on any SkyPilot
+  endpoint, single node, DDP or FSDP (fms-hf-tuning's FSDP1 defaults), ClearML tracking (`auto`
+  when `CLEARML_API_*` creds are present). Training data from a bound dataset, an HF id, or an
+  fms-hf-tuning `data_config`; `args` is fms-hf-tuning's JSON config, checked against its own
+  parser on the node before training starts. Registers the full model or the adapter. Custom
+  image `quay.io/granitebuild/steps/train/fms-hf-tuning/skypilot:fms-v3.2.2-5` (torch 2.8.0 /
+  CUDA 12.8, transformers 4.55.4 with the CVE-2026-5241 fix backported, flash-attn 2.8.3) with a
+  fully hashed lock. Build tests on skypilot/aws (full, aLoRA) and BlueVela SLURM (LoRA/FSDP,
+  full/FSDP with `data_config`). K8s, SkyPilot-K8s and LSF are follow-ups.
 - **`make publish-image` refuses to overwrite an existing image tag (#229).** A tag must keep
   pointing at one image, and SLURM's `slurm_image_cache` keys its `.sqsh` by tag, so a re-pushed
   tag never reached it. `publish-image` now checks the registry first and pushes only a new tag;
@@ -75,8 +85,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dataset pins live in `steps/eval/VENDORED.md` and are fetched at run or image-build
   time (#460).
 
+- **`single_node` step flag (#651)** — `environment_configs.Skypilot.single_node: true` makes
+  gbserver resolve `num_nodes` from every layer the launch reads (`compute_config`, the step's
+  launcher config, the build's `launcher_config`) and fail the step at creation unless it is 1.
+  Other environments refuse the flag. The SkyPilot `openinstruct-sft`, `hf-peft-sft`, `nemo-rl`,
+  `fm-tune`, `fms-hf-tuning` and `mergekit` steps use it instead of their own Jinja `num_nodes`
+  checks: they now accept exactly what gbserver parses as 1 (hf-peft-sft newly accepts `"01"`);
+  only the count the launch would use matters, so a `compute_config.num_nodes: 2` overridden by
+  a build `launcher_config.num_nodes: 1` now passes; and nemo-rl newly checks the build's
+  `launcher_config.num_nodes`. `gb step describe` shows the flag.
+- **`num_nodes` parsing (#651)** — for every SkyPilot step, a boolean `num_nodes` (`true` used
+  to count as one node) is now refused, and a malformed count fails at step creation, with an
+  error that names the key it came from (`compute_config.num_nodes`,
+  `launchers.<name>.config.num_nodes` or `launcher_config.num_nodes`).
+- **Stateless SSO login for the CLI (#723).** `gb auth login --sso` receives the provider's
+  browser redirect on a local listener, `http://127.0.0.1:48731/callback` (`--redirect-port`
+  overrides the port). `gb auth login --sso --remote` is for a CLI that can't receive that
+  redirect, e.g. over SSH: sign in on any device and paste the verification code shown. Both use
+  new gbserver endpoints, `/api/v1/auth/oidc/{authorize,token,remote-callback}`, which keep no
+  login state, so any worker or replica can serve them. **Operators:** register
+  `http://127.0.0.1:48731/callback` and `https://<gbserver-host>/api/v1/auth/oidc/remote-callback`
+  as redirect URIs with the SSO provider, and deploy the server before the CLI: the new CLI
+  can't log in to an older gbserver, and says so before opening the browser. An older CLI
+  still works with a new gbserver, through the legacy endpoints, which still need a single
+  rest-server worker.
+
 ### Changed
 
+- **The fm-tune step moves from the `tune` category to `train` (#677).** Its URI changes from
+  `space://steps/tune/fm-tune` to `space://steps/train/fm-tune`. The source is now
+  `steps/train/fm-tune/`, and the published copies are
+  `configurations/assets/environments/{bash,skypilot}/steps/train/fm-tune/`. The build tests,
+  docs and unit tests are updated. **Breaking:** a build.yaml outside this repo that uses
+  `space://steps/tune/fm-tune` must switch to the new URI. The old one is not kept as an alias.
 - **The `misc` step category is now `aux` (#671).** The byoc step moves from
   `space://steps/misc/byoc` to `space://steps/aux/byoc`; its source is now `steps/aux/byoc/` and
   its published copy is `configurations/assets/environments/skypilot/steps/aux/byoc/`. The
@@ -84,6 +125,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that uses `space://steps/misc/byoc` must switch to the new URI; the old one is not kept as an
   alias. Environment overrides keyed `steps.byoc:` still apply, because they match only the last
   part of the step URI.
+- **Framework steps: share Jinja between templates with `gb-include` (#651).** A
+  `{#- gb-include <path> -#}` line in a `step-template.yaml` is replaced by the file it
+  names, after a `{#- included from steps/<file> -#}` comment, when `make space` /
+  `make publish-step` render the step (`steps/scripts/render_step_template.py`, which
+  replaces the `sed` render; steps without such lines render byte-identically). The
+  SkyPilot `openinstruct-sft` and `hf-peft-sft` steps now share their `args` checks and
+  `args` argv rendering (`steps/train/shared/trainer_args.j2`) and define their
+  `validate` macro once (`macros/validate.j2`) instead of in both `setup:` and `run:`.
+  `fms-hf-tuning` writes its `validate` once the same way (its `args` go to the job as
+  JSON, so it keeps its own checks). All three share one shell-quoting `q()`
+  (`steps/train/shared/q.j2`). Messages are unchanged; the one behaviour change is that
+  a `null` config value (e.g. `clearml_project: null`, `dataset_config: null`) now
+  reaches openinstruct-sft's and hf-peft-sft's scripts as empty, i.e. unset, instead of
+  as the word `None`. The CI test that checks every published `step.yaml` against its
+  source now renders the source as `make publish-step` does, so it also covers
+  `${IMAGE_REF}` and `gb-include` steps.
+
 - **Step resolution: `base_uris` order decides, and environments own steps by `environment.yaml`
   (#558).** `space://steps/<name>` now resolves to the first base, in `base_uris` order, that
   holds a copy serving the active environment, so an earlier base always outranks a later one.
@@ -110,6 +168,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     equally specific copies of a name for the environment, and `Invalid step for its
     environment` when the copy that would be selected is in the environment's own `steps/` but
     doesn't admit it.
+- **`gb build --param-file` (formerly `--parameters-path`) is repeatable and layers over the
+  recipe's `parameters.yaml` instead of replacing it (#663).** `start`, `validate` and
+  `describe` take the recipe's `parameters.yaml` (next to `build.yaml`) as the base, then each
+  `--param-file` in the order given, then `--param`. The last layer wins per top-level key, and
+  a list or map value is replaced whole. For example:
+  `gb build start -f build.yaml --param-file site.yaml --param-file smoke.yaml`.
+  Compatibility: a single `--parameters-path` used to replace `parameters.yaml` completely; now a
+  key the file does not define falls back to `parameters.yaml`. The recipe's `parameters.yaml` is
+  now always loaded, so a malformed one fails the build even when another `--param-file` is
+  passed. A comments-only parameters file now counts as empty instead of failing, and the error
+  for a file that is not a mapping names that file.
 - **With podman, `make publish-image`'s `REGISTRY_USER`/`REGISTRY_PASSWORD` login is scoped to
   `$(REGISTRY)` instead of the whole registry host (#229),** so it no longer replaces your other
   logins on that host. docker still logs in per host.
@@ -273,9 +342,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   launch-time error — add the secret to `secret_names_to_use_as_env_variable` to restore
   it. (Builds whose secret bag contained a non-identifier name were already failing to
   launch on SkyPilot before this change; see Fixed.)
+- **SSO settings are now `GBSERVER_OIDC_*` (#723):** `CLIENT_ID`, `CLIENT_SECRET`,
+  `CALLBACK_URL`, `REMOTE_CALLBACK_URL`, `ISSUER`, `JWKS_URI`, `AUTHORIZE_URL`, `TOKEN_URL`,
+  `USERINFO_URL`. The legacy `GBSERVER_IBMID_*` names are still accepted; the new name wins if
+  both are set, and an empty value counts as unset.
+- **Plain `gb auth login --sso` exits right away when a local browser can't take the redirect
+  (#723)**: in an SSH session, or with no display or browser. It points to `--remote`. Set
+  `BROWSER` to skip the check, e.g. for VS Code Remote-SSH or SSH port forwarding.
 
 ### Deprecated
 
+- **`gb build --parameters-path`, in favor of `--param-file` (#663).** The option now adds a
+  layer instead of naming the one parameters file, and `--param-file` pairs with `--param`.
+  `--parameters-path` still works on `start`, `validate` and `describe` as an alias, and the two
+  names can be mixed; layers apply in command-line order. It will be removed in a future
+  release.
 - **Config keys that carried an input path in steps shipped in v0.3.x (#453).** These
   steps now declare the input as optional and read the binding when it is bound. A bound
   input wins over the key. When the input isn't bound, the step falls back to the old
@@ -296,6 +377,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   downloads when `model` is not bound, so it stays as a real default with no warning.
 
 ### Fixed
+
+- **openinstruct-sft, hf-peft-sft: an `args` value that starts with `-` is refused at step
+  creation (#613).** Each value is its own argv word after the step's flags, so a value
+  such as `--output_dir=/x`, or a list item `--output_dir`, was read by the trainer's
+  argparse as a flag and could override a step-owned one (`output_dir`, `report_to`,
+  `push_to_hub`). A value or list item that starts with `-` followed by anything but a
+  digit or `.` (`-x`, `--x`, `--`) is now refused; negative numbers (`-1`, `-0.5`, `-.5`)
+  and a lone `-` pass. The check lives in `validate_args` in
+  `steps/train/shared/trainer_args.j2`.
 
 - **SkyPilot SLURM: a step's `total_memory_per_node` is sent as `--mem` on clusters that track
   memory (#657).** Before, it was always dropped on SLURM, so jobs got SkyPilot's 1 GB per CPU.
@@ -340,3 +430,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   violated SkyPilot's env-key naming rules and failed the launch. Declared secrets are
   mapped to valid env-var names via `secret_names_to_use_as_env_variable`, so hyphenated
   (and otherwise non-identifier) secret names no longer break SkyPilot launches.
+- **SSO login with several rest-server workers (#723).** Pending logins lived in one worker's
+  memory, so the browser could show "Session not found or expired" or the CLI could poll
+  `/status` without end. The new CLI uses the stateless `/oidc/*` endpoints instead.
+
+### Security
+
+- **Reflected XSS on the legacy SSO `/api/v1/auth/callback` page (#723).** The provider's
+  `error_description` was put into the HTML unescaped; it is now escaped.

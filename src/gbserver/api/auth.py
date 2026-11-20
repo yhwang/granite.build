@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 
-# Copyright LLM.build Authors
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 
 import hmac
 import os
@@ -70,6 +58,10 @@ _PUBLIC_EXACT_PATHS = frozenset(
 # auth_routes.py) — deliberately public.
 # /api/autotunex is intentionally not public: the AutoTuneX upstream does no auth of its own.
 _PUBLIC_PATH_PREFIXES = ("/api/v1/auth", "/dashboard", "/_next")
+
+# The only POSTs that skip auth (exact paths). Code redemption is a POST to
+# keep the PKCE verifier out of URLs and access logs.
+_PUBLIC_POST_PATHS = frozenset({"/api/v1/auth/oidc/token"})
 
 # Every mounted sub-app owns its own Swagger/OpenAPI doc pages directly under
 # its mount point (e.g. /api/v1/builds/docs, /api/v1/builds/openapi.json) — see
@@ -176,8 +168,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
     * ``"apikey"``  – static API key or localhost access
     * ``"github"``  – GitHub Enterprise token (default)
-    * ``"ibmid"``   – IBMid JWT token
-    * ``"multi"``   – both GitHub and IBMid simultaneously
+    * ``"ibmid"``   – SSO (OIDC) JWT
+    * ``"multi"``   – both GitHub and SSO simultaneously
     """
 
     user_cache: dict[str, User]
@@ -207,10 +199,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # allow-listed path is GET-only by nature (docs, config bootstrap,
         # OIDC redirects, static/SPA serving), so this also catches a future
         # mutating endpoint accidentally registered under an otherwise-public
-        # prefix (e.g. POST /dashboard/something).
+        # prefix (e.g. POST /dashboard/something). Exception: _PUBLIC_POST_PATHS.
         if request.method in ("GET", "HEAD") and _is_public_path(request.url.path):
             response = await call_next(request)
             return response
+        if request.method == "POST" and request.url.path in _PUBLIC_POST_PATHS:
+            return await call_next(request)
 
         # Read auth mode at request time (not import time) so that env vars
         # set after import (e.g. by the standalone command) are picked up.

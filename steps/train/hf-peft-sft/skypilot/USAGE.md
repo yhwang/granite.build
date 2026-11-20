@@ -120,8 +120,6 @@ a message that starts `hf-peft-sft:`. They are:
 - `method: qlora` with `mixed_precision: fp16`; `method: qlora` with `distributed: fsdp`
   or `deepspeed` and `mixed_precision: no`;
 - an empty `output`, or one with whitespace or a double quote;
-- `compute_config.num_nodes` or `launcher_config.num_nodes` other than 1 (`1.0` counts
-  as 1);
 - no GPU request: neither `launcher_config.resources.accelerators` nor an
   `instance_type`;
 - `distributed: fsdp` or `deepspeed` with `accelerators` asking for one GPU (`"A10G"`
@@ -133,8 +131,14 @@ a message that starts `hf-peft-sft:`. They are:
 - `args` not a map; an `args` key that is not a bare field name (empty, or with `=`,
   a leading `-` or whitespace); a step-owned flag in `args`, or an abbreviation of
   one (a key that is a proper prefix of it, such as `output_d`); a map or empty-list
-  value in `args`;
+  value in `args`, or a value or list item that starts with `-` followed by anything
+  but a digit or `.` (`-x`, `--x`, `--`);
 - `args.packing` or `args.padding_free` true with `method: alora`.
+
+The step also fails at step creation, with gbserver's own message, unless the `num_nodes`
+the launch would use is 1: the step sets `single_node: true`, and of `compute_config`, the
+step's launcher config and `launcher_config`, the last one set wins. `1.0`, and a string
+such as `"01"` that reads as the integer 1, count as 1.
 
 ## Passing SFTConfig flags (args)
 
@@ -158,11 +162,17 @@ expansion. Parameterise the build with `$${PARAM}` instead.
 | null: `seed: null` | omitted |
 | empty list: `foo: []` | refused at step creation (`--foo` alone would take the next flag as its value) |
 | map | refused at step creation |
+| value starting with `-` and a non-digit: `[a, --output_dir, /x]`, `"--output_dir=/x"` | refused at step creation (the trainer would read it as a flag); a `-` followed by a digit or `.` (a negative number such as `-0.5`, `-1` or `-.5`), and a lone `-`, render as usual |
 
-The step sets these flags itself, so they are refused in `args` (also with `-` in
-place of `_`, and abbreviated: `output_d` or `push_to` is refused too, since the
-parser would take it as the full flag; `gradient_checkpointing` is its own flag, not
-an abbreviation of `gradient_checkpointing_kwargs`):
+A negative number in exponent form passes the step's check, but the trainer's parser
+reads it as a flag, so the run fails. A small YAML float such as `-0.00001` renders in
+that form, `-1e-05`; quote it, `"-0.00001"`, to pass it as written.
+
+The step sets these flags itself, so they are refused in `args`, as keys (also with
+`-` in place of `_`, and abbreviated: `output_d` or `push_to` is refused too, since
+the parser would take it as the full flag; `gradient_checkpointing` is its own flag,
+not an abbreviation of `gradient_checkpointing_kwargs`) and inside values (any value
+that starts with `-` followed by anything but a digit or `.` is refused):
 
 ```
 output_dir, report_to, push_to_hub, hub_model_id, hub_strategy, hub_token,
@@ -483,9 +493,9 @@ string your model's chat template emits before the assistant turn.
 
 ## Notes and limitations
 
-- **Single node only.** `compute_config.num_nodes` must be `1`, and so must
-  `launcher_config.num_nodes` when set. Any other value fails the build at step
-  creation.
+- **Single node only.** The step sets `single_node: true`, so gbserver refuses, when it
+  creates the step, a resolved `num_nodes` other than 1: of `compute_config`, the step's
+  launcher config and `launcher_config`, the last one set wins.
 - **Adapter only.** The step never merges the adapter into the base model. aLoRA
   adapters cannot be merged, and merging into a 4-bit base is lossy. Merge in a
   downstream step if you need a merged LoRA model.

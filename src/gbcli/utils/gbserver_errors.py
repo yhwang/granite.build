@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 """HTTP error types raised by the CLI's gbserver client helpers.
 
 Owned by gbcli (rather than reusing fastapi's ``HTTPException``) so the CLI does
@@ -18,7 +20,7 @@ def relogin_hint() -> str:
     """Re-login instruction for the configured auth provider.
 
     Bare ``gb auth login`` is the GitHub flow (and makes GitHub the default), so an
-    IBMid or API-key user must be pointed at their own flow instead.
+    SSO or API-key user must be pointed at their own flow instead.
     """
     from gbcli.utils.cli_config import get_local_gb_config
     from gbcli.utils.gbcredentials import GBTomlConfig
